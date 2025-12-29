@@ -3,149 +3,127 @@ import cv2
 import numpy as np
 import tensorflow as tf
 
-# --- CONFIGURATION ---
-# Disable scientific notation for clearer output
 np.set_printoptions(suppress=True)
 
-# Load Model
 @st.cache_resource
 def load_model():
     return tf.keras.models.load_model('digit_model.h5')
 
 model = load_model()
 
-def preprocess_image(image):
-    """
-    Preprocesses the image to match Model Input (White Digit / Black BG).
-    Handles both:
-    1. Transparent PNGs (Dataset style)
-    2. Camera Photos (Paper style)
-    """
-    # Check if image has 4 channels (Transparency/Alpha)
-    if image.shape[-1] == 4:
-        # Extract Alpha channel: 0=Transparent (BG), 255=Opaque (Digit)
-        # The dataset has black digits (opaque) on transparent BG. 
-        # The alpha channel essentially gives us the "mask" of the digit.
-        gray = image[:, :, 3]
-        
-        # Apply a simple threshold to clean it up
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
-
+def safe_preprocess(image):
+    h, w = image.shape[:2]
+    target_height = 300
+    aspect_ratio = w / h
+    target_width = int(target_height * aspect_ratio)
+    
+    resized = cv2.resize(image, (target_width, target_height), interpolation=cv2.INTER_AREA)
+    
+    if resized.shape[-1] == 4:
+        gray = resized[:, :, 3] # Alpha channel
+        if np.mean(gray) > 250:
+             gray = cv2.cvtColor(resized, cv2.COLOR_BGRA2GRAY)
+             if np.mean(gray) > 127: gray = cv2.bitwise_not(gray)
     else:
-        # Standard RGB/BGR Image (e.g., from Phone Camera)
-        if len(image.shape) == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        if len(resized.shape) == 3:
+            gray = cv2.cvtColor(resized, cv2.COLOR_BGR2GRAY)
         else:
-            gray = image
+            gray = resized
+            
+        corners = [gray[0,0], gray[0,-1], gray[-1,0], gray[-1,-1]]
+        if np.mean(corners) > 127:
+            gray = cv2.bitwise_not(gray)
+
+    _, thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    kernel = np.ones((3,3), np.uint8)
+    thresh = cv2.dilate(thresh, kernel, iterations=1)
+    
+    return thresh, resized
+
+def prepare_digit_for_model(roi):
+    rows, cols = roi.shape
+    if rows > cols:
+        factor = 20.0 / rows
+        rows = 20
+        cols = int(round(cols * factor))
+    else:
+        factor = 20.0 / cols
+        cols = 20
+        rows = int(round(rows * factor))
         
-        # Thresholding: 
-        # We use THRESH_BINARY_INV because usually we have Dark Digits on Light Paper.
-        # We want to flip that to Light Digits on Dark Background.
-        _, thresh = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    roi = cv2.resize(roi, (cols, rows))
+    
+    padded_roi = np.zeros((28, 28), dtype=np.uint8)
+    pad_top = (28 - rows) // 2
+    pad_left = (28 - cols) // 2
+    padded_roi[pad_top:pad_top+rows, pad_left:pad_left+cols] = roi
+    
+    roi_norm = padded_roi.astype('float32') / 255.0
+    roi_norm = np.expand_dims(roi_norm, axis=0)
+    roi_norm = np.expand_dims(roi_norm, axis=-1)
+    
+    return roi_norm
 
-    return thresh
-
-def sort_contours(cnts):
-    # Sort contours left-to-right
-    boundingBoxes = [cv2.boundingRect(c) for c in cnts]
-    (cnts, boundingBoxes) = zip(*sorted(zip(cnts, boundingBoxes),
-                                        key=lambda b:b[1][0]))
-    return cnts
-
-# --- UI LAYOUT ---
 st.title("📝 Handwritten Digit Recognizer")
-st.markdown("Upload an image (Phone photo or PNG) to detect digits.")
 
 uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "png", "jpeg"])
 
 if uploaded_file is not None:
-    # Read file buffer as byte array
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
-    
-    # LOAD AS 'UNCHANGED' TO KEEP TRANSPARENCY IF PRESENT
     image = cv2.imdecode(file_bytes, cv2.IMREAD_UNCHANGED)
     
-    # Display original image
-    # Note: Streamlit handles transparency well in display
-    st.image(image, caption='Uploaded Image', use_container_width=True)
+    st.image(image, caption='Original Upload', width=200)
     
     if st.button('Detect Digits'):
-        # 1. Preprocess (Get White Digit on Black BG)
-        thresh = preprocess_image(image)
+        thresh, resized_img = safe_preprocess(image)
         
-        # Debug: Show what the computer sees (Optional, good for troubleshooting)
-        with st.expander("See what the model sees"):
-             st.image(thresh, caption='Processed Input (White on Black)', clamp=True)
-        
-        # 2. Find Contours
+        if len(resized_img.shape) == 2:
+            output_img = cv2.cvtColor(resized_img, cv2.COLOR_GRAY2BGR)
+        elif resized_img.shape[2] == 4:
+            output_img = cv2.cvtColor(resized_img, cv2.COLOR_BGRA2BGR)
+        else:
+            output_img = resized_img.copy()
+
+        with st.expander("Debug: View Processed Input"):
+            st.write("Model sees this (must be White Text on Black BG):")
+            st.image(thresh, width=200, clamp=True)
+
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
-        detected_digits = []
-        digit_rects = [] # Store coords to draw boxes later
-        
+        boundingBoxes = [cv2.boundingRect(c) for c in contours]
         if len(contours) > 0:
-            contours = sort_contours(contours)
-            
-            # If the image was transparent, we need a standard BGR copy to draw colored boxes on
-            if len(image.shape) == 3: 
-                output_img = image.copy()
-            else:
-                # Convert BGRA to BGR for drawing
-                output_img = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+            (contours, boundingBoxes) = zip(*sorted(zip(contours, boundingBoxes), key=lambda b:b[1][0]))
+        
+        detected_digits = []
+        found_valid_digit = False
 
-            for c in contours:
-                x, y, w, h = cv2.boundingRect(c)
+        for c in contours:
+            x, y, w, h = cv2.boundingRect(c)
+            
+            if w < 5 or h < 10: 
+                continue
                 
-                # Filter noise: Ignore very small dots
-                if w > 5 and h > 15:
-                    # ROI (Region of Interest)
-                    roi = thresh[y:y+h, x:x+w]
-                    
-                    # Resize logic (preserve aspect ratio)
-                    rows, cols = roi.shape
-                    if rows > cols:
-                        factor = 20.0 / rows
-                        rows = 20
-                        cols = int(round(cols * factor))
-                    else:
-                        factor = 20.0 / cols
-                        cols = 20
-                        rows = int(round(rows * factor))
-                        
-                    roi = cv2.resize(roi, (cols, rows))
-                    
-                    # Pad to 28x28
-                    padded_roi = np.zeros((28, 28), dtype=np.uint8)
-                    pad_top = (28 - rows) // 2
-                    pad_left = (28 - cols) // 2
-                    padded_roi[pad_top:pad_top+rows, pad_left:pad_left+cols] = roi
-                    
-                    # Normalize
-                    roi_norm = padded_roi.astype('float32') / 255.0
-                    roi_norm = np.expand_dims(roi_norm, axis=0) 
-                    roi_norm = np.expand_dims(roi_norm, axis=-1)
-                    
-                    # Predict
-                    prediction = model.predict(roi_norm, verbose=0)
-                    digit = np.argmax(prediction)
-                    confidence = np.max(prediction)
-                    
-                    # Only accept if confidence is decent (optional filter)
-                    if confidence > 0.4:
-                        detected_digits.append(str(digit))
-                        
-                        # Draw box and text
-                        cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
-                        cv2.putText(output_img, str(digit), (x, y - 5), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+            img_h, img_w = thresh.shape
+            if w > 0.9 * img_w and h > 0.9 * img_h:
+                continue
 
-            # Show Result
-            st.image(output_img, caption='Detected Digits', use_container_width=True)
+            found_valid_digit = True
+            roi = thresh[y:y+h, x:x+w]
             
-            if detected_digits:
-                st.success(f"Predicted Number: {''.join(detected_digits)}")
-            else:
-                st.warning("Contours found, but they looked like noise. Try a clearer image.")
+            model_input = prepare_digit_for_model(roi)
             
+            prediction = model.predict(model_input, verbose=0)
+            digit = np.argmax(prediction)
+            confidence = np.max(prediction)
+            
+            detected_digits.append(str(digit))
+            
+            cv2.rectangle(output_img, (x, y), (x + w, y + h), (0, 255, 0), 2)
+            cv2.putText(output_img, str(digit), (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        if found_valid_digit:
+            st.image(output_img, caption='Predictions', use_container_width=True)
+            st.success(f"Result: {''.join(detected_digits)}")
         else:
-            st.error("No digits detected. Try writing darker or using a plain background.")
+            st.warning("No digits found. The image might be blank or the digit is too faint.")

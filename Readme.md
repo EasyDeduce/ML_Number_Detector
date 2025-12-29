@@ -21,7 +21,7 @@ We use a custom CNN optimized for spatial feature extraction:
 1.  **Install Training Dependencies:**
     (Note: These differ from the deployment dependencies)
     ```bash
-    pip install -r requirements_train.txt
+    pip install -r requirements.txt
     ```
 
 2.  **Run the Script:**
